@@ -143,6 +143,13 @@ class _OccupancyMap:
 
     def obstacle_mask(self) -> np.ndarray:
         return self.probability_grid() > 0.65
+    
+    def inflated_mask(self, inflation_radius_m=0.15) -> np.ndarray:
+        from scipy.ndimage import binary_dilation
+        mask = self.obstacle_mask()
+        inflation_cells = max(1, int(inflation_radius_m / self.res))
+        struct = np.ones((inflation_cells * 2 + 1, inflation_cells * 2 + 1), dtype=bool)
+        return binary_dilation(mask, structure=struct)
 
     def explored_ratio(self, threshold=EXPLORED_THRESH) -> float:
         """

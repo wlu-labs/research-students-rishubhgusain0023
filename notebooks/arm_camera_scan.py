@@ -124,11 +124,11 @@ class ArmCameraScanNode(Node):
         self.bot = None
         if ARM_AVAILABLE:
             try:
-                self.bot = Rosmaster()
+                self.bot = Rosmaster(com='/dev/ttyUSB1')
                 self.bot.create_receive_threading()
                 time.sleep(0.5)
                 self.bot.set_uart_servo_torque(True)
-                self.get_logger().info("Arm driver initialised on /dev/ttyUSB0")
+                self.get_logger().info("Arm driver initialised on /dev/ttyUSB1")
             except Exception as e:
                 self.get_logger().error(f"Arm init failed: {e}")
                 self.bot = None

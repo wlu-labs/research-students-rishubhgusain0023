@@ -15,9 +15,9 @@ def generate_launch_description():
                 'queue_size': 50
             }],
             remappings=[
-                ('rgb/image', '/color/image_raw'),
-                ('depth/image', '/depth/image_raw'),
-                ('rgb/camera_info', '/color/camera_info'),
+                ('rgb/image', '/camera/color/image_raw'),
+                ('depth/image', '/camera/depth/image_raw'),
+                ('rgb/camera_info', '/camera/color/camera_info'),
                 ('rgbd_image', '/rgbd_image')
             ]
         ),
@@ -38,9 +38,9 @@ def generate_launch_description():
                 'Odom/ResetCountdown': '0'
             }],
             remappings=[
-                ('rgb/image', '/color/image_raw'),
-                ('depth/image', '/depth/image_raw'),
-                ('rgb/camera_info', '/color/camera_info')
+                ('rgb/image', '/camera/color/image_raw'),
+                ('depth/image', '/camera/depth/image_raw'),
+                ('rgb/camera_info', '/camera/color/camera_info')
             ]
         ),
 
