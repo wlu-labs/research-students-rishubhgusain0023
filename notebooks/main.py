@@ -85,7 +85,7 @@ REPLAN_COOLDOWN   = 2.0     # seconds between replans
 # Camera / arm scan
 SCAN_POSITIONS    = [45, 90, 135]   # servo 1 angles for visual scan
 MOVE_DELAY        = 1.5             # seconds to wait after servo move
-CAM_INDEX         = 1               # OpenCV device index
+CAM_INDEX         = 0               # OpenCV device index
 CAM_HFOV_DEG      = 60.0           # horizontal FOV of camera (degrees)
 SAVE_DIR          = os.path.expanduser("~/scan_images")
 
@@ -227,7 +227,7 @@ class UnifiedMainNode(Node):
         self.bot = None
         if ARM_AVAILABLE:
             try:
-                self.bot = Rosmaster()
+                self.bot = Rosmaster(com='/dev/ttyUSB1')
                 self.bot.create_receive_threading()
                 time.sleep(0.5)
                 self.bot.set_uart_servo_torque(True)
@@ -544,9 +544,13 @@ class UnifiedMainNode(Node):
 
         self.get_logger().info(
             f"[RRT*] Planning to ({self.goal[0]:.2f}, {self.goal[1]:.2f})")
-        t0   = time.time()
-        path = self.rrt_planner.plan((x, y), self.goal)
-        dt   = time.time() - t0
+        t0 = time.time()
+        try:
+            path = self.rrt_planner.plan((x, y), self.goal)
+        except Exception as e:
+            self.get_logger().error(f"[RRT*] Exception in planner: {e} — falling back to A*")
+            path = []
+        dt = time.time() - t0
 
         if path:
             self.waypoints      = self.rrt_planner.smooth_path(path)

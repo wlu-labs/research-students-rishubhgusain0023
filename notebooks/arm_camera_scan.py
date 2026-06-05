@@ -71,7 +71,7 @@ MOVE_DELAY            = 1.5             # seconds to wait after each move
 CAPTURE_PER_POS       = 1               # images to capture per position
 SAVE_DIR              = os.path.expanduser("~/scan_images")
 CAMERA_TOPIC          = "/color/image_raw"
-ROSMASTER_CAM_INDEX   = 1               # OpenCV device index for Rosmaster_Camera
+ROSMASTER_CAM_INDEX   = 0               # OpenCV device index for Rosmaster_Camera
 # ──────────────────────────────────────────────────────────────
 
 
