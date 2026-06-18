@@ -274,6 +274,8 @@ class UnifiedMainNode(Node):
             PoseStamped,   '/virtual_pose',    10)
         self.cmdvel_pub = self.create_publisher(
             Twist,         '/virtual_cmd_vel', 10)
+        self.real_cmdvel_pub = self.create_publisher(
+            Twist,         '/cmd_vel',         10)
         self.odom_pub   = self.create_publisher(
             Odometry,      '/odom_raw',        10)
         self.status_pub = self.create_publisher(
@@ -812,6 +814,13 @@ class UnifiedMainNode(Node):
     # ══════════════════════════════════════════════════════════
 
     def destroy_node(self):
+        # Emergency stop — always send zero velocity on shutdown
+        try:
+            for _ in range(5):
+                self.real_cmdvel_pub.publish(Twist())
+            self.get_logger().info('[SHUTDOWN] Zero velocity sent to /cmd_vel')
+        except Exception:
+            pass
         if self.camera:
             self.camera.clear()
         if self.bot:
