@@ -5,3 +5,16 @@ coverage
 awscli
 flake8
 python-dotenv>=0.5.1
+
+# project dependencies
+numpy
+opencv-python
+scipy
+openai
+openai-whisper
+pyaudio
+ultralytics
+pandas
+matplotlib
+networkx
+seaborn
