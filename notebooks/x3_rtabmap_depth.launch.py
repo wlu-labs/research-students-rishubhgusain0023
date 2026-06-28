@@ -1,3 +1,42 @@
+"""
+x3_rtabmap_depth.launch.py
+---------------------------
+Yahboom ROSMASTER X3 PLUS — ROS2 Humble
+ 
+RTAB-Map RGB-D SLAM launch file.
+Brings up the four-node RTAB-Map pipeline that consumes synchronized
+color and depth frames from the Astra Pro Plus camera and produces
+visual odometry, a dense 3D point-cloud map, and a 2D occupancy grid
+(via Grid/3D + RGBD/CreateOccupancyGrid). Provides the 3D-reconstruction
+half of the SLAM layer described in slam_module.py / lidar_slam_planner.py.
+ 
+Nodes launched (in order):
+  1. rgbd_sync       — time-aligns color + depth streams (20ms window)
+  2. rgbd_odometry   — visual odometry from synchronized RGB-D frames
+  3. rtabmap          — SLAM backend; builds the 3D map + occupancy grid
+  4. rtabmap_viz       — RViz-like visualization window for the 3D map
+ 
+All four nodes use approx_sync=True with a 20ms window, which was
+found necessary because the color and depth streams on this hardware
+are not perfectly synchronized.
+ 
+Run order (must be launched after the camera and base are up):
+  Terminal 1: ros2 launch yahboomcar_description display_X3.launch.py
+  Terminal 2: ros2 run yahboomcar_bringup Mcnamu_driver_X3
+  Terminal 3: ros2 run yahboomcar_base_node base_node_X3
+  Terminal 4: ros2 launch astra_camera astro_pro_plus.launch.xml
+  Terminal 5: ros2 launch ~/x3_rtabmap_depth.launch.py
+ 
+Topics:
+  Subscribed : /camera/color/image_raw    (Astra Pro Plus — color stream)
+               /camera/depth/image_raw    (Astra Pro Plus — depth stream)
+               /camera/color/camera_info  (Astra Pro Plus — color calibration)
+               /odom                      (rtabmap, rtabmap_viz — wheel odometry)
+  Published  : /rgbd_image                (rgbd_sync — synced RGB-D pair)
+               tf: odom -> base_footprint (rgbd_odometry, publish_tf=True)
+               3D point-cloud map + 2D occupancy grid (rtabmap)
+"""
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
