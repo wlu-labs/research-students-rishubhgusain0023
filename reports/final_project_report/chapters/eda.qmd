@@ -33,6 +33,59 @@ A subtle but important finding is that the Astra Pro Plus's color sensor and the
 
 Early attempts to run RTAB-Map against the Astra topics failed because the transform chain was incomplete. The required `base_footprint` frame is published by `display_X3.launch.py` from the `yahboomcar_description` package, not by the motor driver as might be assumed. Once this launch file is added at the top of the startup sequence, the full transform tree (`map → odom → base_footprint → sensor frames`) is available and downstream nodes run correctly.
 
+### USB bus current as a common-mode failure
+
+The single most consequential hardware finding of the project was not discovered until
+several independent sensor faults were examined together. Over successive sessions the
+YDLiDAR reported healthy driver status while its motor produced only buzzing and
+intermittent jolts rather than sustained rotation, before dropping off the USB bus
+entirely; the Astra Pro Plus failed to enumerate on the bus at all, its depth projector
+firing briefly on connection and then cutting out; and the wrist camera was absent from
+`/dev/video*`. Each fault had previously been investigated as a separate driver or
+configuration problem.
+
+Treating the three as a common-mode failure identified the shared cause: the Jetson's
+bus was not delivering sufficient current to sustain three simultaneously-powered
+peripherals, two of which (the LiDAR's rotating motor and the Astra's infrared projector)
+draw substantially more than a typical UVC device. With a powered USB hub in place, all
+three faults cleared with no software change. 
+
+Following the hub installation, the sensors were characterized as follows.
+
+| Configuration                  | Topic                        | Rate       |
+|--------------------------------|------------------------------|------------|
+| LiDAR alone                    | `/scan`                      | 10.16 Hz   |
+| Astra alone                    | `/camera/depth/image_raw`    | ~21 Hz     |
+| LiDAR + Astra concurrent       | `/scan`                      | 10.03 Hz   |
+| LiDAR + Astra concurrent       | `/camera/depth/points`       | ~18 Hz     |
+
+: Sensor publication rates after powered-hub installation {#tbl-sensor-rates}
+
+The reduction in point-cloud rate from approximately 21 Hz to 18 Hz under concurrent
+operation is attributable to shared bus bandwidth rather than to power, and no dropout
+was observed in either stream during concurrent runs. The depth stream had never
+previously operated on this platform.
+
+### Non-deterministic serial enumeration and the udev symlink
+
+The YDLiDAR does not enumerate to a stable device path: across reboots and reconnections
+it was observed on several different `/dev/ttyUSB*` nodes. Rather than editing the
+driver's `TG.yaml` configuration on each occurrence, a udev rule was written that matches
+the unit's CP210x USB-to-serial bridge by vendor and product identifier (`10c4:ea60`) and
+creates the stable symlink `/dev/ydlidar`. The driver configuration now targets the
+symlink and requires no maintenance across re-enumeration. A model-specific configuration
+correction was also applied: the generic `ydlidar.yaml` produces an `Incorrect Lidar Type`
+warning on the TG30, and the model-specific `TG.yaml` with `lidar_type: 0` is required.
+
+### Correction to the RTAB-Map topic namespace
+
+Chapter 2 of the previous report documented the Astra publishing to `/color/image_raw`
+and `/depth/image_raw`. On the current camera launch configuration the topics carry a
+`/camera/` prefix — `/camera/color/image_raw`, `/camera/depth/image_raw`, and
+`/camera/color/camera_info`. The remappings in `x3_rtabmap_depth.launch.py` were corrected
+accordingly. This is recorded here because the failure mode is silent: RTAB-Map's
+synchronizer waits indefinitely for messages that never arrive, producing no error output.
+
 ## ROS 2 Topic Landscape
 
 Table 1 summarizes the topics produced and consumed by the subsystems described in the next chapter. These were identified via repeated use of `ros2 topic list`, `ros2 topic info`, and `ros2 topic echo` during the bring-up phase, and serve as the "interface contract" between modules of the system.
@@ -58,7 +111,9 @@ Table 1 summarizes the topics produced and consumed by the subsystems described 
 A significant portion of the first month of the project was spent identifying a startup sequence that reliably brings up every subsystem. The following order was determined empirically and is now documented inside the repository:
 
 1. `ros2 launch yahboomcar_description display_X3.launch.py` — publishes URDF and `base_footprint` transform.
-2. `ros2 run yahboomcar_bringup Mcnamu_driver_X3` — opens the motor controller on `/dev/ttyUSB1` and subscribes to `/cmd_vel`.
+2. `ros2 run yahboomcar_bringup Mcnamu_driver_X3` — opens the motor controller and subscribes to `/cmd_vel`. The driver hard-codes `/dev/ttyUSB0`; on the current image the controller enumerates at `/dev/ttyUSB1`, and the driver source was updated to
+target the correct node directly rather than relying on a manually-created symlink, which does not survive reboot.
+
 3. `ros2 run yahboomcar_base_node base_node_X3` — publishes `/odom` from wheel encoders. Note that this node lives in a separate package (`yahboomcar_base_node`) from the motor driver, a fact that is not obvious from the default Yahboom documentation.
 4. `ros2 launch orbbec_camera astro_pro_plus.launch.xml` — starts the RGB-D camera on the correct UVC product ID.
 5. `ros2 launch <user_pkg> x3_rtabmap_depth.launch.py` — starts the RGB-D synchronizer, visual odometry, and RTAB-Map SLAM.

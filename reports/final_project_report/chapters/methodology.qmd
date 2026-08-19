@@ -29,7 +29,7 @@ The full pipeline is organized into one unified ROS 2 node (`main.py`, class `Un
 
 1. **ROS 2 bringup layer** — Yahboom-supplied drivers and launch files that publish raw sensor data and accept motor commands.
 2. **SLAM layer** — a custom `SLAMModule` (`slam_module.py`) that builds a log-odds occupancy grid from `/scan` and `/odom`, complemented by RTAB-Map for 3D reconstruction and visual odometry from RGB-D.
-3. **Path-planning layer** — a two-tier strategy with RRT\* (`rrt_virtual_mover.py`) as the primary planner and an A\*-based grid planner (`lidar_slam_planner.py`) as the fallback. Both planners operate on the same occupancy grid and publish to `/planned_path`.
+3. **Path-planning layer** — a two-tier strategy with HMA-RRT\* (`rrt_virtual_mover_quadtree.py`) as the primary planner and an A\*-based grid planner (`lidar_slam_planner.py`) as the fallback. Both planners operate on the same occupancy grid and publish to `/planned_path`.
 4. **Perception and task-execution layer** — the unified node subscribes to a `/task` topic, drives an arm-mounted camera sweep, runs YOLOv8 object detection on each captured frame, converts a successful detection into a world-frame goal using LiDAR-fused bearing estimation, publishes the goal, follows the resulting path via a virtual mover, and performs an arm interaction sequence on arrival.
 5. **Virtual executor** — an in-node virtual mover that follows the planned path at a fixed speed, publishing fake odometry and TF so that the full pipeline can be exercised without consuming on-site robot time. The real motor driver (`Mcnamu_driver_X3`) subscribes to `/cmd_vel` and accepts the same velocity commands when physical motion is desired.
 
@@ -58,6 +58,24 @@ $$\text{yaw} = \arctan_2\!\bigl(2 (q_w q_z + q_x q_y),\; 1 - 2 (q_y^2 + q_z^2)\b
 ### RTAB-Map for 3D reconstruction
 
 In parallel with the 2D occupancy grid, RTAB-Map is launched via `x3_rtabmap_depth.launch.py`. The launch file spawns four nodes: `rgbd_sync` time-aligns the color and depth streams, `rgbd_odometry` produces visual odometry, `rtabmap` serves as the SLAM backend with `Grid/3D` and `RGBD/CreateOccupancyGrid` enabled, and `rtabmap_viz` provides an RViz-like visualization window. All four nodes use `approx_sync: True` with a 20 ms window, which was found to be necessary because the color and depth streams on this hardware are not perfectly synchronized. RTAB-Map's ability to produce both dense 3D point clouds and 2D occupancy grids from a single RGB-D pipeline has been demonstrated across a wide range of platforms and datasets [@labbe_rtab-map_2019].
+
+### Occupancy-map interface consolidation
+
+The previous report documented an interface drift between `slam_module.py` and `rrt_virtual_mover.py`: the RRT\* planner called `inflated_mask()` on the occupancy map handed to it by the unified node, while `slam_module.py`'s `_OccupancyMap` exposed only `obstacle_mask()` and `probability_grid()`. Obstacle inflation had historically been performed locally inside the A\* planner, so the standalone RRT\* node — which carries its own occupancy-map class — worked correctly while the unified node did not.
+
+The resolution moves inflation into the SLAM module, which is the architecturally correct location: inflation is a property of the robot's physical footprint relative to the map, not of any particular search algorithm, and duplicating it per planner invites exactly this class of drift. The method added to `_OccupancyMap` is:
+
+```python
+def inflated_mask(self, inflation_radius_m=0.15) -> np.ndarray:
+    from scipy.ndimage import binary_dilation
+    mask = self.obstacle_mask()
+    inflation_cells = max(1, int(inflation_radius_m / self.res))
+    struct = np.ones((inflation_cells * 2 + 1,
+                      inflation_cells * 2 + 1), dtype=bool)
+    return binary_dilation(mask, structure=struct)
+```
+
+The default inflation radius of 0.15 m matches the value used throughout the project and the signature is compatible with the planner's zero-argument call site. Both planners now consume the same inflated mask from the same source.
 
 ## A\* Grid Path Planner (Fallback)
 
@@ -91,9 +109,53 @@ The "star" in RRT\* comes from the rewiring step: after a new node is added, the
 
 In the unified node, RRT\* is invoked first for every planning request. If RRT\* fails to find a path within its iteration budget, the A\* planner is invoked as a fallback on the same occupancy grid. The fallback exists because RRT\*'s stochasticity means it occasionally fails on a particular random seed even when a valid path exists; A\* is deterministic and will always find a path if one is present in the discretized grid. Which planner produced the accepted path is tracked in an `active_planner` field so that downstream logs and metrics can distinguish primary-success runs from fallback runs.
 
+### Exception-safe fallback
+
+The two-tier design was intended to invoke A\* whenever RRT\* fails, but as originally written the fallback triggered only when the primary planner *returned* a false-valued result. An exception raised inside the planner propagated out of `_replan()` and terminated the node. Since a planner operating on live sensor data can fail in ways that raise rather than return — interface mismatches, degenerate maps, numerical edge cases — the call site now wraps the primary planner in exception handling, so that any failure mode routes to the deterministic fallback:
+
+```python
+rrt_path = []
+try:
+    rrt_path = self.rrt_planner.plan(start, goal)
+except Exception as exc:
+    self.get_logger().warn(f"RRT* raised: {exc}; falling back to A*")
+
+if not rrt_path:
+    rrt_path = self.astar_planner.plan(start, goal, rcx, rcy)
+    self.active_planner = "A*"
+else:
+    self.active_planner = "RRT*"
+```
+
+This is a small change with a disproportionate effect on system robustness: it converts the most likely failure mode of the stochastic primary planner from a node crash into a degraded-but-functional fallback.
+
 ### Why RRT\* was preferred on this platform
 
 The indoor environments encountered in this project are relatively open: most paths have only a handful of obstacles. In that setting, RRT\*'s waypoint count is dominated by the number of random samples needed, which in practice is small. A\* on a $400 \times 400$ grid with 8-connected neighbours produces hundreds of waypoints for even a short path, and smoothing is required to produce a reasonable trajectory. RRT\* produces a trajectory consisting of a handful of waypoints natively, with no additional smoothing needed beyond the planner's internal path-simplification pass. Recent work confirms that enhanced RRT\* variants achieve meaningful reductions in both path length and turning-point count compared to grid-based alternatives [@yin_route_2024]. Chapter 4 quantifies this difference.
+
+## RRT\* Variant Hierarchy
+
+The single RRT\* implementation described above was extended into a three-variant hierarchy in order to establish which algorithmic refinements are worth their computational cost on the target hardware. Each variant is a strict superset of the one before it, and all three share identical configuration parameters — a 0.30 m step size, 0.1 goal-sampling bias, and 0.30 m goal tolerance — so that any measured difference is attributable to the algorithmic change rather than to tuning.
+
+**Baseline (`rrt_virtual_mover.py`).** Brute-force RRT\* with linear-scan nearest-neighbour search. Each new sample requires an $O(n)$ pass over the existing tree, so per-iteration cost grows linearly with tree size, and total planning cost grows quadratically. When a steer step collides with an obstacle, the iteration is discarded.
+
+**HMA-RRT\* (`rrt_virtual_mover_quadtree.py`).** Adds two mechanisms drawn from the hierarchical multi-agent RRT\* literature. First, the node set is maintained in a QuadTree, reducing nearest-neighbour and radius queries from $O(n)$ to $O(\log n)$ average case. Because the rewiring step performs a radius query on every iteration, this improvement compounds. Second, a *side-retreat escape* replaces the bare collision discard: when a steer step is blocked, the planner attempts a small number of rotated side-shifts from the same parent node before abandoning the iteration. In tight geometry — corridors, doorways, maze-like arrangements — a large fraction of samples steer into obstacles, and recovering rather than discarding them materially improves the sample-efficiency of the search.
+
+**Convex-corridor smoothing (`rrt_virtual_mover_convex.py`).** Builds on the HMA-RRT\* tree search and adds a post-processing stage. A convex free-space corridor is constructed around the returned path, and a quadratic program solved with SLSQP finds the minimum-curvature trajectory that remains inside that corridor. The result is a geometrically smoother and slightly shorter path, obtained at the cost of the QP solve.
+
+The three variants expose the same `plan(start_world, goal_world)` signature and are therefore drop-in interchangeable in the unified node. One interface asymmetry is worth noting: the baseline and HMA-RRT\* variants expose smoothing as a static `RRTPlanner.smooth_path(waypoints)` method, whereas the convex variant implements it as a module-level `convex_corridor_smooth(path, occ_map, obs)` function with a different argument list, since the QP requires access to the obstacle mask.
+
+### Benchmark methodology
+
+Comparing the variants fairly required each to build its own occupancy map from the same sensor input, rather than being handed a precomputed obstacle mask — the map-construction path is part of what each variant does at runtime, and short-circuiting it would measure the wrong thing. A synthetic LiDAR ray-caster (`synthetic_world.py`) was therefore written to generate 360-degree scans from ground-truth obstacle geometry and feed them through each variant's own `OccupancyMap.update(scan, x, y, yaw)` method — the identical call each node makes from its live `/scan` callback.
+
+The ray-caster was configured to the YDLiDAR TG30's published specification — 720 beams per revolution, 12 m maximum range, and 1 cm range noise — so that the occupancy grids the planners search over carry the same angular resolution and noise characteristics as those built from the real sensor. Matching the noise model matters because obstacle inflation operates on a thresholded probability grid, and a noiseless scan would produce cleaner obstacle boundaries than the planners encounter in deployment.
+
+The harness (`benchmark_rrt_variants.py`) runs without a ROS 2 graph. Because the Jetson is accessed remotely and hosts the live ROS 2 graph, publishing synthetic `/scan` messages into that graph would have conflicted with the running system; lightweight stub modules for the ROS 2 message types allow the real planner classes to be imported and exercised unmodified outside of ROS.
+
+Nineteen environments were used: four hand-constructed scenarios (open room, narrow corridor, cluttered room, and maze) and fifteen randomized obstacle fields drawn at three density tiers, five per tier. Each variant was run ten times in each environment, yielding 570 planner invocations in total. Randomization across trials matters because RRT\* is stochastic and single-trial timings are not meaningful. A defect in the randomized world generator was identified and corrected before the reported runs: start and goal points could be placed close enough to the room's boundary wall that the wall's inflated footprint marked them as occupied, causing the planner to reject a trial that was in fact solvable. The corner-nudge logic was clamped to displace such points strictly toward the room interior. The benchmark was executed on the Jetson Orin NX itself, so the reported timings reflect deployment hardware rather than a development workstation.
+
+Four metrics were recorded per trial: success (whether a path to within goal tolerance was returned), waypoint count, path length in metres, and wall-clock planning time. Path smoothness was additionally quantified as the mean squared second difference of the waypoint sequence, used as a curvature proxy — lower values indicate a trajectory with fewer and gentler direction changes.
 
 ## Natural-Language Task Interface
 
@@ -163,11 +225,29 @@ On arrival at a task-driven goal, the node transitions to the INTERACTING state 
 
 Each step is separated by a 1.0-1.5 second delay to allow the servos to complete their motion. The sequence is open-loop: it does not adapt its reach pose to the object's measured 3D location, and it does not verify a successful grasp. This is acknowledged as a limitation in Chapter 5.
 
+## Supporting Modules
+
+Four modules were developed alongside the core pipeline. Each has been verified in simulation or dry-run mode; none is currently active in the live navigation path, and they are documented here as implemented capability rather than as validated system behaviour.
+
+**Reactive obstacle avoidance (`obstacle_avoider.py`).** A LiDAR-driven safety layer independent of the planner, operating as a four-state machine — CLEAR, SLOW, VEER, STOP — selected by the minimum range within a forward cone. It is the only component besides the motor driver that publishes real `/cmd_vel`, and it is intended to sit beneath the planner as a last-resort collision guard, since a planner replanning at a fixed interval cannot respond to an obstacle appearing between replans. All four states were verified against synthetic 100-ray scan messages at 0.8 m, 0.5 m, and 0.2 m minimum range.
+
+**LLM navigation planner (`navgpt_planner.py`).** A NavGPT-style planner in which a large language model receives a serialized textual description of the robot's observations and returns a navigation action. The module implements an explore / move-to / stop action cycle and has been verified in dry-run mode and against injected synthetic model responses.
+
+**Pick-and-place manipulation (`arm_grab_place.py`).** A fourteen-step pick, transport, and place routine using a three-link planar inverse-kinematics solution with a preset-pose fallback when no solution exists. This extends the fixed open-loop reach-grip-lift-home sequence of the previous report toward pose-conditioned manipulation, though grasp verification remains absent.
+
+**Voice input (`voice_input.py`).** Speech-to-text using OpenAI Whisper with PyAudio capture, publishing transcribed instructions to `/task`. Investigation established that the Yahboom platform's built-in speech module is a closed-vocabulary serial recognizer that returns fixed integer command identifiers with no raw audio passthrough, and is therefore unusable for open-vocabulary instruction parsing. The module consequently requires an external USB microphone, which is not yet connected; the script has never been executed against live audio. It also currently lacks wake-word gating and transcribes in a continuous loop.
+
 ## Virtual Mover for Offline Evaluation
 
 A practical challenge in evaluating the planner is that each physical robot trial requires remote session time and coordination with the physical environment. To mitigate this, the unified node includes an in-process virtual mover that consumes the planned path and walks a simulated robot along the waypoints at a fixed speed (0.3 m/s by default), publishing fake odometry and TF at 20 Hz. This allows the full planner-to-execution pipeline — including task parsing, YOLO detection, goal selection, RRT\* planning, waypoint following, and the arm interaction sequence — to be exercised without physically moving the robot's base. The system subscribes to both `/odom` and `/odom_raw` transparently, so it works identically with real or virtual motion.
 
 A standalone virtual-mover node (`virtual_mover.py`) is also preserved in the codebase from an earlier iteration and can be used to drive the same planner-executor loop against a saved occupancy grid, without the full task-execution pipeline active.
+
+### Emergency-stop provision
+
+During physical testing, a manually-issued `ros2 topic pub /cmd_vel ... --once` command left the wheels driving after the issuing terminal was closed, because the motor driver holds the last commanded velocity indefinitely in the absence of a new message. The robot had to be lifted clear of the ground and the driver node terminated to stop it.
+
+Two provisions were added in response. The unified node now holds a `real_cmdvel_pub` publisher on `/cmd_vel` in addition to its existing `/virtual_cmd_vel` publisher, and `destroy_node()` issues repeated zero-velocity messages on that publisher during shutdown, so that terminating the node halts the base rather than freezing it at its last commanded velocity. It is worth stating precisely what this does and does not cover: it addresses node shutdown only, and would not have prevented the incident itself, which originated from a command issued outside the node entirely. The second provision is procedural — a standing rule that no command producing real base motion is issued over the remote connection unless a collaborator is physically present with the robot.
 
 ## Integration and Final Pipeline
 

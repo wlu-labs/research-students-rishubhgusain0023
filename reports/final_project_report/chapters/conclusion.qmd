@@ -14,7 +14,37 @@ Several concrete findings emerged over the course of the project.
 
 - **A modular, topic-based architecture enabled independent development and testing of each subsystem.** In particular, the in-node virtual mover made it possible to exercise the full planner-to-execution pipeline without consuming physical motion time, and the dual-camera-source design of the arm-scan component made it possible to test YOLOv8 detection regardless of whether the Astra camera was active.
 
-- **The unified pipeline reaches nine of twelve integration points on its first end-to-end test.** In the representative test documented in Chapter 4, `/task` parsing, state-machine transitions, arm sweep, camera capture, YOLOv8 inference (chair detections at confidences 0.74-0.84), best-detection selection, LiDAR-fused bearing estimation, and RRT\* invocation all fired correctly. An interface-drift bug between the SLAM module and the RRT\* planner prevented the final three stages (path return, waypoint following, arm interaction) from completing.
+- **The unified pipeline now completes all twelve integration points.** The
+  interface-drift defect that halted the previous evaluation was resolved as predicted, by
+  adding `inflated_mask()` to the SLAM module's occupancy-map class and making the planner
+  fallback exception-safe. No further design change was required to unblock the final three
+  stages.
+
+- **Common-mode reasoning resolved three sensor faults that resisted individual
+  diagnosis.** The LiDAR, depth camera, and wrist camera had each been investigated as
+  separate driver problems over multiple sessions. Examined together, they shared a single
+  cause — insufficient USB bus current — and a powered hub resolved all three with no
+  software change. The general lesson is that a device reporting healthy driver status
+  while failing to function physically is evidence pointing away from configuration, and
+  simultaneous unrelated-seeming faults in independently-powered peripherals warrant a
+  common-mode hypothesis before individual investigation.
+
+- - **Algorithmic refinements to RRT\* pay off in proportion to environment complexity.**
+  Across 600 trials on the deployment hardware, QuadTree-accelerated neighbour search with
+  side-retreat collision escape was essentially level with the brute-force baseline on
+  sparse obstacle fields, roughly twice as fast at medium density, and three to eight times
+  faster on structurally constrained hand-built maps such as corridors and mazes. The
+  refinement is therefore well matched to the workload, since planning cost is highest
+  exactly where the advantage is largest — but it is worth noting that on open maps, which
+  describe much of the test environment, the added machinery buys almost nothing.
+
+
+- **Smoothness and latency trade against each other, and the current system is
+  latency-bound.** Convex-corridor QP smoothing reduced the curvature proxy roughly
+  nineteen-fold, but at a planning-time cost incurred on every replan, against an execution
+  benefit that the current constant-velocity waypoint follower does not exploit. The
+  variant is retained against future conditions that would reverse that balance.
+
 
 ## Implications
 
@@ -26,9 +56,26 @@ More broadly, the project illustrates that a meaningful fraction of the effort i
 
 Several limitations of the current system should be acknowledged.
 
-- **An interface-drift bug halts execution at RRT\* planning.** The most consequential limitation is an `AttributeError` raised by `rrt_virtual_mover.py` when it calls `self.map.inflated_mask()` on the `_OccupancyMap` instance from `slam_module.py`. The SLAM module's occupancy map currently exposes only `obstacle_mask()` and `probability_grid()`; inflation was historically performed locally inside the A\* planner rather than in the SLAM class. The bug prevents the end-to-end pipeline from completing path planning even though every preceding stage (perception, detection, goal estimation, state transition) works correctly. This is the top-priority fix for continuing work (see Future Work below).
+- **Sensor stability under autonomous motion is uncharacterized.** The Astra camera has
+  been observed to disconnect and re-enumerate when the robot is displaced manually, a
+  fault attributed to USB cable strain relief. Whether autonomous `/cmd_vel` motion
+  reproduces it is untested. Until it is, any navigation result that depends on the depth
+  stream carries an unquantified risk of intermittent sensor loss.
 
-- **The A\* fallback does not trigger on RRT\* exceptions.** The two-tier planner design was intended to activate A\* when RRT\* fails, but the current failure mode (an unhandled `AttributeError`) propagates out of the planner call rather than being returned as an empty path. The fallback path only triggers when the planner returns a false-valued result, not when it raises.
+- **The benchmark environments are synthetic.** The planner comparison was executed on the
+  deployment hardware, which makes the timings representative, but the occupancy maps were
+  built from ray-cast synthetic geometry rather than recorded LiDAR scans. Real scans carry
+  noise, spurious returns, and reflective-surface artefacts that synthetic ray casting does
+  not reproduce, and these affect the obstacle mask that the planners search over. The
+  relative ordering of the variants is unlikely to change, but the absolute timings should
+  be treated as a lower bound.
+
+- **The supporting modules are unvalidated on hardware.** Reactive obstacle avoidance, the
+  LLM navigation planner, pick-and-place manipulation, and voice input have each been
+  exercised only in simulation or dry-run mode. None is active in the live navigation path,
+  and voice input in particular has never run against real audio, since no USB microphone
+  is connected.
+
 
 - **Instruction parsing is minimal.** The task node recognizes only instructions that match entries in a fixed task-to-label dictionary (nine entries covering common objects such as chair, bottle, cup, phone, laptop, book, and person). Richer instructions involving relations ("the bottle on the table"), ordinals ("the second chair"), or multi-step actions ("pick up the bottle and put it on the table") are not supported. Recent VLN surveys document a broad shift toward foundation-model-driven embodied planning that could address this limitation [@zhang_vision-and-language_2024; @chen_mapgpt_2024], but integrating such systems was out of scope for the present engineering-focused project.
 
@@ -46,18 +93,54 @@ Several limitations of the current system should be acknowledged.
 
 The limitations above translate into a prioritized future-work list.
 
-1. **Fix the `inflated_mask()` interface-drift bug.** Add an `inflated_mask(inflation_radius_m=0.15)` method to the `_OccupancyMap` class in `slam_module.py` that returns the obstacle mask dilated by the robot footprint, and update `rrt_virtual_mover.py` to call it. Additionally, wrap the RRT\* planner call in the unified node's `_replan()` method in a `try`/`except` block so that any planner exception triggers the A\* fallback rather than crashing the node. This single fix is expected to unblock the remaining three pipeline stages (path return, waypoint following, arm interaction) without any further design changes.
+1. **Characterize sensor stability under autonomous motion.** With a collaborator present
+   and the Astra USB cable secured for strain relief, drive the robot under `/cmd_vel`
+   while monitoring `/scan` and `/camera/depth/image_raw` publication rates for dropout.
+   This gates every subsequent result that depends on live perception during motion and
+   should therefore precede the benchmark work below.
 
-2. **Run a formal end-to-end success-rate benchmark.** Define 30-50 natural-language tasks across a known set of objects and room configurations, execute each three times with a fresh SLAM map, and report success rate, detection rate per object class, path-planning failure rate, and end-to-end completion time.
+2. **Integrate neural-guided sampling into the RRT\* planner.** Rather than sampling the
+   configuration space uniformly, train a lightweight network to propose samples in regions
+   likely to lie on the optimal path, conditioned on the occupancy grid and the start-goal
+   pair. Reported reductions in planning time for this class of method fall in the 30–75%
+   range. This is the most natural ML contribution for the project: it targets the component
+   already established as the system's latency bottleneck, it is evaluable on the existing
+   600-trial benchmark harness without modification, and a smaller resulting tree would
+   reduce the relative cost of convex-corridor smoothing, potentially making that variant
+   viable as the primary planner.
 
-3. **Integrate the semantic-aware cost formulation from Mohiuddin's simulation work directly into the RRT\* planner.** This is the most natural algorithmic extension, and the platform is now ready for it.
+3. **Replace the fixed task-to-label dictionary with a structured-observation LLM subgoal
+   planner.** The current nine-entry dictionary admits only single-object instructions. A
+   planner that serializes existing YOLO detections and LiDAR ranges into a structured
+   textual observation, submits it to a language model, and receives a subgoal coordinate
+   would support relational and multi-step instructions while leaving RRT\* as the
+   safety-critical executor. This approach requires no model training, and the language
+   model runs off-device via an API, so it adds no inference load to the Jetson. It
+   subsumes the existing `navgpt_planner.py` work.
 
-4. **Replace the fixed task-to-label dictionary with a small language model.** This would enable richer instruction forms and multi-step tasks, and would allow the system to synthesize YOLO class lists on the fly instead of requiring manual dictionary entries.
+4. **Estimate object depth from the wrist camera monocularly.** The current system infers
+   object distance from the LiDAR range at the detection bearing, which fails for tabletop
+   objects where the ray passes beneath or beside the object and strikes the wall behind.
+   A lightweight monocular depth network of the class benchmarked on Jetson-family hardware
+   would address the limitation directly, and could be fused with the LiDAR estimate rather
+   than replacing it.
 
-5. **Add active perception.** If the first arm sweep does not yield a detection, the robot should rotate its base or reposition itself rather than immediately declaring failure.
+5. **Run a formal end-to-end success-rate benchmark.** Define 30–50 natural-language tasks
+   across a known object set and room configurations, execute each three times from a fresh
+   SLAM map, and report success rate, per-class detection rate, planning failure rate, and
+   completion time. This is the principal quantitative gap remaining in the evaluation.
 
-6. **Use the Astra depth sensor for object distance instead of (or alongside) LiDAR range.** This would provide accurate depth on tabletop objects and resolve the current LiDAR-ray-passes-through-object failure mode.
+6. **Activate the reactive obstacle avoider beneath the planner.** The module is written
+   and simulation-verified but not in the live path. A planner replanning on a fixed
+   interval cannot respond to an obstacle appearing between replans, which is exactly the
+   gap the avoider is designed to close.
 
-7. **Close the loop on manipulation.** Verify grasp success using current-sensing on the gripper servo or contact sensors, and retry the grasp if it fails.
+7. **Connect a USB microphone and add wake-word gating to voice input.** The Whisper
+   pipeline is implemented but has never run against live audio. Wake-word gating is
+   required regardless, since continuous transcription is impractical.
 
-Taken together, these extensions would transform the present engineering deliverable into a full VLN research platform. The groundwork laid in this project — a working startup sequence, a unified modular architecture, a SLAM layer, two working planners, a YOLOv8 perception pipeline, a LiDAR-fused object localizer, a natural-language task state machine, and an open-loop arm interaction routine — provides the foundation on which those extensions can be built.
+8. **Close the loop on manipulation.** Verify grasp success through gripper-servo current
+   sensing or contact sensing, and retry on failure. The pick-and-place module's
+   inverse-kinematics solution provides the pose conditioning; what is missing is the
+   feedback signal.
+

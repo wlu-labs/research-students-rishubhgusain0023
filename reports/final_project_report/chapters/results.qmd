@@ -8,7 +8,7 @@ Two path planners, one perception pipeline, and one task-execution state machine
 
 **A\* grid planner.** An 8-connected grid search with an octile-distance heuristic, operating on the 2D log-odds occupancy grid after obstacle inflation by 0.15 m. Paths are smoothed with a five-cell moving-average filter before publication. Serves as the fallback planner in the unified node.
 
-**RRT\* sampling-based planner.** Tree-based search with goal biasing (probability 0.1), a 0.25 m step size, and asymptotic-optimality rewiring. Serves as the primary planner in the unified node.
+**RRT\* sampling-based planners.** Three variants of tree-based search with goal biasing (probability 0.1) and asymptotic-optimality rewiring, sharing a 0.30 m step size and 0.30 m goal tolerance: a brute-force baseline (`rrt_virtual_mover.py`), an HMA-RRT\* variant adding QuadTree-accelerated nearest-neighbour search and side-retreat collision escape (`rrt_virtual_mover_quadtree.py`), and a further variant adding convex-corridor QP smoothing (`rrt_virtual_mover_convex.py`). The HMA-RRT\* variant serves as the primary planner in the unified node.
 
 **Arm-camera perception pipeline.** A three-position arm-sweep (45°, 90°, 135°) with YOLOv8 nano inference on each captured frame at a confidence threshold of 0.40, followed by LiDAR-fused bearing estimation to convert the highest-confidence detection into a world-frame goal.
 
@@ -23,6 +23,8 @@ For the planner comparison:
 - **Waypoint count** — number of points in the returned `/planned_path`. Fewer is generally better because it simplifies execution.
 - **Path length (m)** — sum of Euclidean distances between consecutive waypoints.
 - **Planning time (s)** — wall-clock time from the moment the goal is published to the moment `/planned_path` is published.
+- **Success rate** — the fraction of planning trials in which a path reaching within the goal tolerance was returned.
+- **Curvature proxy** — the mean squared second difference of the waypoint sequence, used as a scale-free measure of trajectory smoothness. Lower values indicate fewer and gentler direction changes.
 
 For the perception pipeline:
 
@@ -36,104 +38,171 @@ For the end-to-end system:
 
 ## End-to-End Pipeline Test
 
-A representative end-to-end test was carried out on 20 April 2026, with the robot accessed remotely via RustDesk. The startup sequence described in Chapter 2 was executed in order: `display_X3.launch.py`, `Mcnamu_driver_X3`, `base_node_X3` (from the `yahboomcar_base_node` package), and then the unified `main.py` node.
+The interface-drift defect that halted the previous evaluation was resolved, and the unified pipeline was subsequently run to completion on the physical platform.
 
-At startup, the unified node reported that all three optional subsystems loaded successfully:
-
-```text
-=======================================================
-  UnifiedMainNode ready
-  SLAM     : slam_module.py
-  Primary  : RRT*
-  Fallback : A*
-  Camera   : YES
-  YOLO     : YES
-  Arm      : YES
-=======================================================
-```
-
-Two hardware-configuration issues had to be resolved to reach this state, both of which are now documented in the project repository:
-
-1. The `CAM_INDEX` parameter in `main.py` defaulted to 1, which does not correspond to a capture device on this Jetson image (OpenCV reports "Device `/dev/video1` is not a capture device"). Changing the parameter to 0 allowed `Rosmaster_Camera` to open the wrist camera. This is consistent with the `/dev/video0` device mapping documented in Chapter 2.
-2. The `ARM_HOME` pose, originally `[90, 90, 90, 90, 90, 90]`, left the arm pointing vertically upward with the wrist camera oriented at the ceiling. All three sweep positions therefore captured images of the ceiling, and YOLOv8 returned no detections. Changing the home pose to `[90, 115, 25, 45, 90, 90]` adjusted the shoulder, elbow, and wrist-pitch servos in combination, directing the camera toward the room rather than the ceiling. Tuning more than one joint proved necessary because the arm's kinematic chain means a shoulder-only tilt leaves the wrist pointed at an unhelpful angle. Subsequent runs produced detections immediately.
+Three configuration corrections were required alongside the interface fix. The `Rosmaster()` constructor requires an explicit serial port on this Jetson image and was changed to `Rosmaster(com='/dev/ttyUSB1')`; no baud-rate argument is accepted, as the library sets it internally. The `CAM_INDEX` parameter in both `main.py` and `arm_camera_scan.py` was corrected from 1 to 0, consistent with the wrist camera's `/dev/video0` mapping documented in Chapter 2. The RTAB-Map launch remappings were updated to the `/camera/`-prefixed topic namespace.
 
 ### Observed pipeline execution
 
-After the two fixes above, the task `"chair"` was published:
+With these corrections in place, the task `"chair"` was published and the pipeline executed through every stage to the DONE state. The arm swept its three scan positions, YOLOv8 returned a chair detection at the 135-degree position with confidence 0.82, the LiDAR-fused bearing estimator produced a world-frame goal, RRT\* returned a three-waypoint path in 0.009 seconds, the virtual mover followed the path to within the 0.30 m tolerance, and the arm executed the reach, grip, lift, and home sequence. This is the first execution in which every integration point completed.
 
-```
-ros2 topic pub /task std_msgs/String "{data: 'chair'}" --once
-```
+A second run reached DONE via the A\* fallback, returning a 21-waypoint path. The contrast between three RRT\* waypoints and 21 A\* waypoints on comparable geometry is consistent with the argument made in Chapter 3 for preferring sampling-based planning on this class of map, and confirms that the fallback path is now genuinely reachable rather than being bypassed by an uncaught exception.
 
-The unified node logged the following trace (timestamps abbreviated):
+A subsequent verification run bypassed the visual scan by publishing directly to `/goal`, isolating the planner and execution layers from the perception layer. RRT\* returned a three-waypoint path of 1.04 m in 0.009 seconds, which the virtual mover followed to completion. Testing the planner independently of perception matters because a failure in the combined pipeline is otherwise ambiguous between the two layers.
 
-```
-[TASK] Received: 'chair'
-[TASK] Searching for: ['chair']
-[STATUS] Scanning for: ['chair']
-[SCAN] Sweeping arm: [45, 90, 135] deg
-[SCAN] FOUND 'chair' at 45 deg (conf=0.84, cx=0.06)
-[SCAN] FOUND 'chair' at 45 deg (conf=0.75, cx=0.20)
-[SCAN] FOUND 'chair' at 90 deg (conf=0.74, cx=0.24)
-[SCAN] 135 deg — nothing detected
-[SCAN] 'chair' estimated at world (0.48, -1.42), dist=1.50m
-[STATUS] Found 'chair' at (0.48, -1.42)
-[RRT*] Planning to (0.48, -1.42)
-```
-
-At this point execution stopped because of a bug in the planner-to-SLAM interface (see the Bug Encountered During Testing subsection below).
-
-### Interpretation of the observed trace
-
-The observed trace confirms that a substantial portion of the pipeline works correctly on the physical platform. Specifically:
-
-1. **The `/task` topic is wired correctly.** The string message was received and parsed, and the TASK_LABEL_MAP successfully resolved `"chair"` to the label list `["chair"]`.
-2. **State-machine transitions occur as designed.** The IDLE → SCANNING transition fired, a `/task_status` message was published, and the scan routine was invoked.
-3. **The arm-camera sweep executes correctly.** The servo was commanded to 45°, 90°, and 135° in sequence, with a settling delay between positions. The wrist-camera driver (`Rosmaster_Camera`) returned frames at every position.
-4. **YOLOv8 inference runs on real captured frames.** Three bounding boxes were returned across the 45° and 90° sweep positions, with confidence scores between 0.74 and 0.84. The class labels were compared against the target list and matched the `chair` label correctly.
-5. **The best-detection-selection logic works correctly.** Across the multiple detections, the highest-confidence detection (0.84 at the 45° position, with normalized horizontal center 0.06) was selected as the target.
-6. **The LiDAR-fused bearing estimator produces a plausible world pose.** The bearing formula combined the servo angle (45°), the bounding-box center (0.06 — near the left edge of the 45° frame), and the robot's current yaw, and the LiDAR fallback distance of 1.5 m was used because no valid range was available at that bearing at the time of the test. The resulting estimate of $(0.48, -1.42)$ is geometrically consistent with a chair positioned forward-right of the robot.
-7. **The NAVIGATING transition and RRT\* invocation fire correctly.** The state machine transitioned on the goal, the goal position was passed to the planner, and RRT\* began executing.
-
-### Bug encountered during testing
-
-Execution halted inside `rrt_virtual_mover.py` with:
-
-```
-AttributeError: '_OccupancyMap' object has no attribute 'inflated_mask'
-```
-
-Inspection revealed an interface drift between two modules developed at different points in the project: the RRT\* planner (`rrt_virtual_mover.py`) expects the occupancy map to expose a method `inflated_mask()`, whereas `slam_module.py`'s `_OccupancyMap` class exposes only `obstacle_mask()` and `probability_grid()`. Obstacle inflation had originally been performed locally inside the A\* planner (`lidar_slam_planner.py`, via a SciPy `binary_dilation` call) rather than inside the SLAM map class itself.
-
-The consequence is that the RRT\* primary planner currently raises an exception the first time it is invoked against a live SLAM map produced by the unified node. Because the exception is an unhandled `AttributeError` rather than a return value of `None`, the A\* fallback path is not currently triggered — the try/except flow in `_replan()` expects the planner to return `False` or an empty path on failure, not to raise.
-
-This bug was identified at the end of the test session and was not fixed within the project timeline. Its resolution is listed as the first item in the future-work section of Chapter 5.
 
 ## Results Table — Observed End-to-End Pipeline Stage Coverage
 
 Table 3 summarizes which stages of the unified pipeline were observed to execute successfully during the end-to-end test run.
 
-| Pipeline stage                              | Status           | Evidence in the log                                       |
-|---------------------------------------------|------------------|-----------------------------------------------------------|
-| `/task` topic subscription                  |  Works          | `[TASK] Received: 'chair'`                                |
-| TASK_LABEL_MAP string-to-label lookup       |  Works          | `[TASK] Searching for: ['chair']`                          |
-| IDLE → SCANNING state transition            |  Works          | `[STATUS] Scanning for: ['chair']`                         |
-| Arm servo sweep at 45° / 90° / 135°          |  Works          | Arm moved physically (verified on site)                   |
-| Wrist-camera frame capture                  |  Works          | `[SCAN] FOUND 'chair' at 45 deg (conf=0.84, cx=0.06)`       |
-| YOLOv8 inference                            |  Works          | Three bounding boxes returned, confidences 0.74-0.84       |
-| Best-detection selection across positions   |  Works          | 0.84-confidence detection retained                         |
-| LiDAR-fused bearing estimation              |  Works          | `'chair' estimated at world (0.48, -1.42), dist=1.50m`     |
-| NAVIGATING state transition                 |  Works          | `[RRT*] Planning to (0.48, -1.42)`                         |
-| RRT\* planner invocation                     |  Reached        | Planner `.plan()` method called                            |
-| RRT\* path return                            |  Blocked        | `AttributeError: inflated_mask`                            |
-| A\* fallback activation                      |  Not triggered  | Exception thrown before except-path could execute          |
-| Virtual-mover waypoint following            |  Not reached    | No path available                                         |
-| INTERACTING state transition                |  Not reached    | No goal reached                                           |
-| Arm reach / grip / lift sequence            |  Not reached    | No goal reached                                           |
+| Pipeline stage                              | Status    | Evidence                                          |
+|---------------------------------------------|-----------|---------------------------------------------------|
+| `/task` topic subscription                  | Works     | `[TASK] Received: 'chair'`                        |
+| TASK_LABEL_MAP string-to-label lookup       | Works     | `[TASK] Searching for: ['chair']`                 |
+| IDLE to SCANNING state transition           | Works     | `[STATUS] Scanning for: ['chair']`                |
+| Arm servo sweep at 45 / 90 / 135 degrees    | Works     | Arm motion verified on site                       |
+| Wrist-camera frame capture                  | Works     | Frames returned at all three positions            |
+| YOLOv8 inference                            | Works     | Chair detected at 135 deg, confidence 0.82        |
+| Best-detection selection across positions   | Works     | Highest-confidence detection retained             |
+| LiDAR-fused bearing estimation              | Works     | World-frame goal produced                         |
+| NAVIGATING state transition                 | Works     | `[RRT*] Planning to (...)`                        |
+| RRT\* planner invocation                     | Works     | Planner `.plan()` entered                         |
+| RRT\* path return                            | Works     | 3 waypoints, 1.04 m, 0.009 s                      |
+| A\* fallback activation                      | Works     | 21-waypoint path returned on fallback run         |
+| Virtual-mover waypoint following            | Works     | Goal reached within 0.30 m tolerance              |
+| INTERACTING state transition                | Works     | State transition logged                           |
+| Arm reach / grip / lift / home sequence     | Works     | Four-step sequence completed physically           |
+| DONE state                                  | Works     | Terminal state reached                            |
 
-: End-to-end pipeline stage coverage from the representative test run {#tbl-stage-coverage}
+: End-to-end pipeline stage coverage following the interface fix {#tbl-stage-coverage}
 
-Nine of the twelve integration points between subsystems executed correctly on the first attempt after the two configuration fixes described above. The final three stages were not reached because of the planner-to-SLAM interface bug.
+All twelve integration points identified in the previous report now execute correctly, compared with nine previously. The three stages that were unreachable — path return, waypoint following, and arm interaction — were unblocked by the interface fix alone, with no further design change, as had been predicted.
+
+## RRT\* Variant Benchmark
+
+The three planner variants described in Chapter 3 were compared over 570 planning trials
+on the Jetson Orin NX, spanning nineteen environments at ten trials per environment per
+variant.
+
+### Success rate
+
+All three variants returned a valid path in every trial. This is the expected result for a
+set of environments constructed to be solvable, and its value is diagnostic rather than
+comparative: it establishes that neither the QuadTree spatial index nor the convex-corridor
+smoothing stage introduces a failure mode absent from the baseline, which is the primary
+risk in adopting either. Success rate therefore does not discriminate between the variants,
+and the comparison rests on the remaining metrics.
+
+### Aggregate performance
+
+| Variant    | Mean time (ms) | Mean waypoints | Mean length (m) | Curvature proxy |
+|------------|----------------|----------------|-----------------|-----------------|
+| Baseline   | 61.8           | 19.7           | 13.42           | 0.155           |
+| HMA-RRT\*  | 31.5           | 19.8           | 13.34           | 0.157           |
+| Convex     | 52.3           | 19.8           | 12.82           | 0.0063          |
+
+: Aggregate planner performance across all trials, measured on the Jetson Orin NX {#tbl-planner-aggregate}
+
+HMA-RRT\* halved the baseline's mean planning time, from 61.8 ms to 31.5 ms, while
+producing paths of statistically indistinguishable length, waypoint count, and curvature.
+The convex variant landed between the two on time, and separated sharply from both on
+curvature.
+
+### Planning time by environment structure
+
+The aggregate conceals the finding that most justifies the QuadTree work, because averaging
+an open room together with a maze produces a figure representative of neither. The four
+hand-constructed scenarios separate the effect cleanly, since they differ in structure
+rather than merely in obstacle count.
+
+| Environment      | Baseline (ms) | HMA-RRT\* (ms) | Convex (ms) | Speed-up |
+|------------------|---------------|----------------|-------------|----------|
+| Open room        | 26.1          | 24.2           | 42.5        | 1.1x     |
+| Cluttered room   | 53.7          | 47.1           | 74.9        | 1.1x     |
+| Maze             | 108.0         | 28.0           | 46.6        | 3.9x     |
+| Narrow corridor  | 110.5         | 13.0           | 20.5        | 8.5x     |
+
+: Mean planning time on the hand-constructed environments, ten trials per cell {#tbl-planner-handbuilt}
+
+The speed-up column is the ratio of baseline to HMA-RRT\* time, and it spans nearly an
+order of magnitude across the four scenarios. In the open room and the cluttered room the
+two variants are effectively tied. In the maze the QuadTree variant is 3.9 times faster,
+and in the narrow corridor 8.5 times faster.
+
+The pattern follows from the two mechanisms and is consistent with what each predicts. In
+an open room few samples collide and the tree stays small, so neither the $O(\log n)$
+neighbour query nor the side-retreat escape has much to act on, and the baseline's linear
+scan remains competitive. The cluttered room is dense but not constricted — obstacles are
+scattered rather than forming passages — so samples still find free space readily. The maze
+and the narrow corridor are structurally constrained: the tree must grow large before a
+solution is found, which is where the logarithmic query overtakes the linear scan, and a
+high proportion of steer steps collide, which is where side-retreat recovers samples the
+baseline discards. That the two effects compound is visible in the corridor result, where
+the baseline is the slowest of all four environments and HMA-RRT\* is the fastest.
+
+The randomized obstacle fields, which vary obstacle count while holding structure roughly
+constant, show the same ordering in a narrower band.
+
+| Obstacle density | Baseline (ms) | HMA-RRT\* (ms) | Convex (ms) |
+|------------------|---------------|----------------|-------------|
+| Sparse           | 35.8          | 29.5           | 51.1        |
+| Medium           | 68.3          | 32.8           | 53.9        |
+| Dense            | 70.8          | 35.0           | 56.7        |
+
+: Mean planning time by obstacle density, randomized worlds {#tbl-planner-density}
+
+HMA-RRT\* is faster at every density, with the margin widening from 1.2 times on sparse
+fields to roughly 2 times at medium and dense. The comparison across the two tables
+supports a specific conclusion: obstacle *density* alone produces a roughly twofold
+advantage, whereas obstacle *structure* — passages, corridors, dead ends — produces up to
+an eightfold one. Density and structure are not interchangeable proxies for difficulty.
+
+### Path quality
+
+Waypoint counts were near-identical across variants, both in aggregate (19.7, 19.8, and
+19.8) and per environment; the narrow corridor produced twelve to thirteen waypoints under
+all three. This is the expected outcome given that all three share a step size and goal
+tolerance: the number of tree extensions needed to span an environment is a property of the
+geometry and the step size, not of how the nearest neighbour is located. The variants
+differ in how quickly they find the path and in its geometric quality, not in how many
+points describe it.
+
+The curvature proxy is where the convex variant separates. Baseline and HMA-RRT\* score
+0.155 and 0.157 — effectively identical, confirming that the QuadTree index and
+side-retreat escape change how the tree is searched rather than what it produces. Convex
+scores 0.0063, roughly twenty-five times lower, which is the direct consequence of the
+SLSQP objective explicitly minimizing this quantity. In the open room it reached 0.0000,
+producing an essentially straight path. Mean path length follows the same ordering with a
+far smaller spread — 13.42 m, 13.34 m, and 12.82 m — the last representing an approximately
+four percent reduction.
+
+The practical consequence of the curvature difference is worth stating, since the metric is
+otherwise abstract. A high curvature score means the motor driver receives many rapid
+heading changes in close succession, which stresses the Mecanum drive and produces visibly
+jerky motion. The convex variant's near-zero score corresponds to a trajectory the drive
+can execute smoothly.
+
+### Planner selection
+
+HMA-RRT\* was adopted as the primary planner. It is faster than the baseline in every
+environment tested, dramatically so in structured ones, while matching it on waypoint
+count, path length, and curvature to within trial variation. The baseline therefore retains
+no operational role and is kept only as the comparative reference point for this benchmark.
+
+The convex variant was not adopted, and the reasoning deserves stating because its headline
+smoothness figure is genuinely impressive. Two considerations weigh against it. First, it
+is slower than the plain baseline in fourteen of the nineteen environments; the five where
+it wins are those in which the baseline itself recorded an unusually slow trial, so the
+apparent advantage reflects the baseline's variance rather than the smoother's speed.
+Second, and more decisively, the pipeline replans on a fixed interval during navigation, so
+planning latency is incurred repeatedly throughout every traversal, whereas trajectory
+smoothness affects execution quality only. The current virtual mover follows waypoints at a
+constant 0.3 m/s and does not exploit smoother geometry.
+
+That balance would change under either of two conditions: if the arm-interaction approach
+angle becomes sensitive to the trajectory's final heading, or if neural-guided sampling
+reduces tree size enough that the QP solve becomes proportionally cheap. The variant is
+retained in the codebase for those cases.
 
 ## Per-Subsystem Verification
 
@@ -143,13 +212,17 @@ Each subsystem was independently verified at various points during development, 
 
 **A\* planner.** The A\* planner was tested standalone via `lidar_slam_planner.py`, publishing goals on `/goal` and observing that `/planned_path` was returned for a range of start-goal configurations. When the goal was placed inside an inflated obstacle, the outward-search fallback successfully produced a nearby-free-cell goal. A\* reliably returned paths on the SLAM maps generated during development.
 
-**RRT\* planner (offline).** The RRT\* planner was tested standalone through `rrt_virtual_mover.py`, which contains its own occupancy-map abstraction. Under that abstraction the planner returns valid paths and the virtual mover follows them successfully. The integration bug between the SLAM module's occupancy map and the RRT\* planner's expected interface was introduced when the two modules were assembled into the unified node and was not caught until the end-to-end test.
+**RRT\* planner (offline).** The RRT\* planner was tested standalone through `rrt_virtual_mover.py`, which contains its own occupancy-map abstraction. Under that abstraction the planner returns valid paths and the virtual mover follows them successfully. The integration bug between the SLAM module's occupancy map and the RRT\* planner's expected interface was introduced when the two modules were assembled into the unified node, was not caught until the end-to-end test of the previous term, and has since been resolved as described above.
 
 **YOLOv8 detection.** As shown in the end-to-end trace, YOLOv8 nano successfully detected instances of the `chair` class in real captured frames from the Rosmaster wrist camera, returning confidences in the 0.74-0.84 range.
 
 **Arm interaction.** The arm reach-grip-lift-home sequence has been tested in isolation by publishing a goal directly on `/goal` (bypassing the visual scan), arriving at the goal via the virtual mover, and observing the four-step servo sequence execute. The servo positions `[90, 45, 90, 90, 90, 60]` for the reach pose and `30°` for gripper close produce the expected physical arm motion.
 
 **Virtual mover.** The in-node virtual mover was verified by publishing a pre-baked path manually and observing the robot's virtual pose advance at the configured speed of 0.3 m/s, with TF and odometry published at 20 Hz and RViz showing the robot sliding along the path.
+
+**Sensor stack.** Following the powered-hub installation, the LiDAR was confirmed publishing structured range data on `/scan` at 10.16 Hz and visualized in RViz2 under a top-down orthographic projection, producing a recognizable two-dimensional floor plan of the laboratory. The Astra Pro Plus depth stream was confirmed at approximately 21 Hz and visualized as a three-dimensional point cloud — the first successful depth-stream operation on this platform. Under concurrent operation the two held 10.03 Hz and approximately 18 Hz respectively with no dropout. The wrist camera and the Astra colour stream were distinguished by their supported format lists via `v4l2-ctl`: the wrist camera offers YUYV only at a maximum of 640 x 480, while the Astra colour stream offers MJPG up to 2048 x 1536.
+
+**Arm.** The full servo sequence — base rotation through 45, 90, and 135 degrees, shoulder articulation, reach pose, gripper open and close, lift, and return to home — was verified physically by driving `Rosmaster_Lib` directly. This required stopping `Mcnamu_driver_X3` first, since the motor driver and the arm library contend for the same serial port and cannot hold it simultaneously.
 
 ## Visualization
 
@@ -178,6 +251,16 @@ Two parameters were informally varied during development.
 
 - **Arm home pose.** As described above, varying the ARM_HOME pose from `[90, 90, 90, 90, 90, 90]` (original, camera facing ceiling) to `[90, 115, 25, 45, 90, 90]` (camera facing forward via coordinated shoulder / elbow / wrist-pitch adjustment) was the single most important change for making the arm-sweep perception pipeline produce useful frames. This is a strong reminder that perception tuning on a physical robot includes mechanical configuration as well as algorithmic parameters.
 
+## Known Gap: Sensor Stability Under Autonomous Motion
+
+One characterization remains outstanding and is stated explicitly rather than left implicit. During a session in which the robot was pushed manually, the Astra camera raised an `onDeviceDisconnected` event and re-enumerated, recovering on its own. The cause was traced to insufficient strain relief on the camera's USB cable rather than to power, since the powered hub was in place at the time.
+
+Whether autonomous base motion driven by `/cmd_vel` produces the same disconnection has not been tested. The distinction matters: a camera that survives bench operation but drops out under motion would invalidate any navigation result depending on the depth stream, and the fault would present intermittently and be difficult to attribute. The test is deferred because project policy requires a collaborator to be physically present before any command producing real base motion is issued over the remote connection, and it is listed as the first hardware item in the future-work section of Chapter 5.
+
 ## Summary
 
-The end-to-end test demonstrated that nine of the twelve integration points in the unified natural-language-driven navigation pipeline execute correctly on the real robot, up to and including RRT\* planner invocation. YOLOv8 inference on wrist-camera frames reliably detected chairs in the test environment with confidences between 0.74 and 0.84. Execution halted inside the RRT\* planner because of an unrecovered API mismatch between `slam_module.py` and `rrt_virtual_mover.py`, which is identified as the top-priority fix in Chapter 5.
+The interface-drift defect identified as the top-priority fix in the previous report was resolved by relocating obstacle inflation into the SLAM module's occupancy-map class and by making the planner fallback exception-safe. With that fix and three configuration corrections, the unified pipeline executed all twelve integration points to the DONE state on the physical platform, completing perception, goal estimation, planning, path following, and arm interaction in a single run.
+
+The planner layer was extended into a three-variant hierarchy and evaluated over 570 trials on the target hardware. All variants succeeded in every trial. HMA-RRT\* halved the baseline's mean planning time overall, was roughly twice as fast at medium and high obstacle density, and reached speed-ups of 3.9 and 8.5 times on the maze and narrow-corridor scenarios respectively; it was adopted as the primary planner. The convex-smoothing variant reduced the curvature proxy roughly twenty-five-fold but was slower than the baseline in most environments, and is retained for future use where trajectory smoothness becomes the binding constraint.
+
+A hardware campaign traced concurrent LiDAR, depth-camera, and wrist-camera failures to a single common cause of insufficient USB bus current and resolved all three with a powered hub, bringing the depth stream into operation for the first time. Sensor stability under autonomous base motion remains uncharacterized and is the principal open item.

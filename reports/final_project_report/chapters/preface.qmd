@@ -7,3 +7,12 @@ The work described in the following chapters covers the full journey of bringing
 Rather than focusing on a single algorithmic contribution, this report takes a system-level view. It describes the architectural decisions made at each stage, the practical problems encountered during deployment, and the engineering fixes that were applied. It also documents the switch from A\* to RRT\* as the primary path planner, the integration of RTAB-Map for dense three-dimensional mapping, and the design of a modular task-execution state machine that links natural-language input to arm-camera scanning, object detection, and autonomous navigation.
 
 The intended audience for this report includes the supervising professor, future research students continuing work on the same platform, and peers interested in the practical realities of deploying Vision-Language Navigation (VLN) research on embedded robotic hardware. Effort has been made to record not only what works, but also the debugging sequences and hardware-specific discoveries that proved necessary to reach a working system, so that subsequent students on the project can avoid rediscovering the same issues.
+
+This edition extends the previous report with a second term of work. The interface defect
+that prevented the pipeline from completing has been resolved and the system now runs
+end-to-end on the physical platform; the path planner has been developed into a
+three-variant hierarchy and evaluated quantitatively on the deployment hardware; and a
+long-standing sensor availability problem has been traced to a single common cause and
+resolved, bringing the depth camera into operation for the first time. Sections describing
+work that has been implemented but not yet validated on hardware are marked as such
+throughout, and the reader should treat that distinction as load-bearing.

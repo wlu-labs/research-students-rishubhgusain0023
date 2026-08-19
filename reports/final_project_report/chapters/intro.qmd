@@ -32,8 +32,8 @@ This includes identifying the correct startup sequence, resolving any device-dri
 **Objective 2: Implement a SLAM pipeline that produces both a 2D occupancy grid for planning and a 3D point-cloud map for visualization and verification.**  
 The 2D map is used by the path planner; the 3D map gives a human-readable representation of the environment that confirms the robot is mapping correctly.
 
-**Objective 3: Implement and compare at least two path planners on the same SLAM-generated maps.**  
-An A\* grid planner was developed first as a baseline, and an RRT\* sampling-based planner was developed afterwards on supervisor guidance. Both planners are retained in the codebase, and the report compares them on waypoint count, path length, and planning time.
+**Objective 3: Implement and compare multiple path planners on the same SLAM-generated maps.**  
+An A\* grid planner was developed first as a baseline, and an RRT\* sampling-based planner was developed afterwards on supervisor guidance. Both planners are retained in the codebase, and the report compares them on waypoint count, path length, and planning time. In the second term the RRT\* family was extended into three variants and evaluated quantitatively over 570 trials on the deployment hardware.
 
 **Objective 4: Connect a natural-language interface to the planning stack through an object-detection module and a task-level state machine.**  
 The robot must be able to accept a text instruction of the form "find the \<object\>", use its arm-mounted camera to scan the environment, run YOLOv8 object detection to locate a match, and drive to the detected object.
